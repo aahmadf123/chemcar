@@ -30,6 +30,7 @@ except Exception as e:
 
 # Constants
 DEFAULT_SAMPLE_HZ = 5.0
+DEFAULT_INTERVAL_SEC = None  # Optional explicit period between AS7343 reads
 SMOOTH_WINDOW = 4
 HYSTERESIS_COUNT = 4
 ALPHA_THRESHOLD = 0.25
@@ -218,8 +219,8 @@ def read_tcs34725(sensor):
         print(f"Warning: TCS34725 read failed: {e}")
         return None
 
-def get_baseline(as_sensor, tcs_sensor, sample_rate, duration=2.0):
-    """Get dark baseline (sensors covered)"""
+def get_baseline(as_sensor, tcs_sensor, sample_rate, duration=2.0, sensor_gap=0.0):
+    """Get dark baseline (sensors covered) with optional inter-sensor delay"""
     print(f"\nCOVER BOTH SENSORS NOW")
     print(f"Acquiring baseline for {duration} seconds...")
     time.sleep(2.5)  # Give time to cover
@@ -237,7 +238,10 @@ def get_baseline(as_sensor, tcs_sensor, sample_rate, duration=2.0):
             for ch, val in as_data.items():
                 as_sum[ch] += val
             as_count += 1
-        
+
+        if HAS_AS7343 and HAS_TCS and sensor_gap > 0:
+            time.sleep(sensor_gap)
+
         # Read TCS34725
         tcs_data = read_tcs34725(tcs_sensor)
         if tcs_data:
@@ -294,7 +298,13 @@ def main():
     parser.add_argument('--out', default=os.path.expanduser('~/chemcar_data'),
                        help='Output directory')
     parser.add_argument('--rate', type=float, default=DEFAULT_SAMPLE_HZ,
-                       help='Sample rate in Hz')
+                       help='Sample rate in Hz (ignored when --interval is set)')
+    parser.add_argument('--interval', type=float, default=DEFAULT_INTERVAL_SEC,
+                       help='Explicit interval in seconds between AS7343 reads; overrides --rate')
+    parser.add_argument('--tcs-offset', type=float, default=1.0,
+                       help='Time after AS7343 read to trigger TCS34725 read (seconds)')
+    parser.add_argument('--sensor-gap', type=float, default=0.02,
+                       help='Minimum delay between sequential sensor reads (seconds)')
     parser.add_argument('--test', action='store_true',
                        help='Test mode: just read sensors')
     parser.add_argument('--skip-baseline', action='store_true',
@@ -304,6 +314,13 @@ def main():
     parser.add_argument('--as-addr', type=lambda x: int(x, 0), default=0x39,
                        help='AS7343 I2C address (default: 0x39)')
     args = parser.parse_args()
+
+    period = args.interval if args.interval is not None else 1.0 / args.rate
+    if period <= 0:
+        raise ValueError("Interval must be positive")
+
+    # Offset when both sensors are present (e.g., AS7343 at t=0s, TCS at t=offset)
+    tcs_offset = max(args.sensor_gap, min(args.tcs_offset, period))
     
     print("=" * 70)
     print("CHEME CAR LUMINOL DETECTOR - SIMPLIFIED")
@@ -333,19 +350,27 @@ def main():
     # Test mode
     if args.test:
         print("\nTEST MODE - Reading sensors 10 times...")
+        next_tick = time.monotonic()
         for i in range(10):
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(next_tick - now)
+
             print(f"\n--- Sample {i+1} ---")
             if HAS_AS7343:
                 data = read_as7343(as_sensor)
                 if data:
                     print(f"AS7343: F2={data['F2']}, NIR={data['NIR']}, Clear={data['Clear']}")
+            if HAS_AS7343 and HAS_TCS and tcs_offset > 0:
+                time.sleep(tcs_offset)
             if HAS_TCS:
                 data = read_tcs34725(tcs_sensor)
                 if data:
                     print(f"TCS34725: R={data['R']}, G={data['G']}, B={data['B']}, C={data['C']}")
-            time.sleep(1.0 / args.rate)
+
+            next_tick += period
         return 0
-    
+
     # Setup run
     run_id = iso_timestamp()
     as_csv, tcs_csv = setup_csv_files(args.out, run_id)
@@ -354,7 +379,10 @@ def main():
     as_baseline = {}
     tcs_baseline = {}
     if not args.skip_baseline:
-        as_baseline, tcs_baseline = get_baseline(as_sensor, tcs_sensor, args.rate)
+        baseline_rate = 1.0 / period
+        as_baseline, tcs_baseline = get_baseline(
+            as_sensor, tcs_sensor, baseline_rate, sensor_gap=tcs_offset
+        )
     else:
         print("\nSkipping baseline calibration")
     
@@ -363,133 +391,159 @@ def main():
     tcs_smoother = RollingAverage(SMOOTH_WINDOW)
     as_endpoint = EndpointDetector(HYSTERESIS_COUNT)
     tcs_endpoint = EndpointDetector(HYSTERESIS_COUNT)
-    
+
     as_last_smooth = None
     tcs_last_smooth = None
     as_s0 = None
     tcs_s0 = None
     anchor_samples = []
-    
-    period = 1.0 / args.rate
+
     sample_count = 0
-    
+    status_counter = 0
+
+    as_s_smooth = 0
+    as_slope = 0
+    as_end = 0
+    tcs_s_smooth = 0
+    tcs_slope = 0
+    tcs_end = 0
+
+    # Schedule the sensor reads so TCS is offset from AS when both are present
+    loop_start = time.monotonic()
+    as_next = loop_start
+    tcs_next = loop_start if not HAS_AS7343 else loop_start + tcs_offset
+
     print("\nSTARTING DATA ACQUISITION")
     print("Mix luminol and oxidizer now!")
     print("Press Ctrl+C to stop\n")
-    
+
     try:
         while True:
-            t = timestamp()
-            
-            # Read AS7343
-            as_data = read_as7343(as_sensor)
-            as_s_smooth = 0
-            as_slope = 0
-            as_end = 0
-            
-            if as_data and HAS_AS7343:
-                # Dark subtract
-                blue_raw = as_data.get('F2', 0)
-                blue_corrected = max(0, blue_raw - as_baseline.get('F2', 0))
-                
-                # Calculate sum of visible channels
-                vis_sum = 0
-                for ch in ['F1', 'F2', 'FZ', 'F3', 'F4', 'F5', 'FY', 'F6', 'F7', 'F8']:
-                    vis_sum += max(0, as_data.get(ch, 0) - as_baseline.get(ch, 0))
-                
-                # Blue signal ratio
-                s_blue = blue_corrected / vis_sum if vis_sum > 0 else 0
-                
-                # Establish S0 from first few samples
-                if len(anchor_samples) < 5:
-                    anchor_samples.append(s_blue)
-                    as_s0 = sum(anchor_samples) / len(anchor_samples)
-                
-                # Relative signal
-                s_rel = s_blue / as_s0 if as_s0 > 0 else 0
-                
-                # Smooth and slope
-                as_s_smooth = as_smoother.add(s_rel)
-                as_slope = 0
-                if as_last_smooth is not None:
-                    as_slope = (as_s_smooth - as_last_smooth) / period
-                as_last_smooth = as_s_smooth
-                
-                # Endpoint detection
-                condition = (as_s_smooth <= ALPHA_THRESHOLD and 
-                           abs(as_slope) <= BETA_THRESHOLD)
-                as_end = 1 if as_endpoint.check(condition) else 0
-                
-                # Write to CSV
-                with open(as_csv, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    row = [t, run_id]
-                    row.extend([as_data.get(ch, 0) for ch in AS_CHANNELS])
-                    row.extend([s_blue, s_rel, as_s_smooth, as_slope, as_end])
-                    writer.writerow(row)
-            
-            # Read TCS34725
-            tcs_data = read_tcs34725(tcs_sensor)
-            tcs_s_smooth = 0
-            tcs_slope = 0
-            tcs_end = 0
-            
-            if tcs_data and HAS_TCS:
-                # Dark subtract
-                b_corrected = max(0, tcs_data['B'] - tcs_baseline.get('B', 0))
-                r_corrected = max(0, tcs_data['R'] - tcs_baseline.get('R', 0))
-                g_corrected = max(0, tcs_data['G'] - tcs_baseline.get('G', 0))
-                
-                # Blue ratio
-                rgb_sum = r_corrected + g_corrected + b_corrected
-                s_blue = b_corrected / rgb_sum if rgb_sum > 0 else 0
-                
-                # Establish S0
-                if tcs_s0 is None and len(anchor_samples) >= 5:
-                    tcs_s0 = s_blue
-                
-                # Relative signal
-                s_rel = s_blue / tcs_s0 if tcs_s0 else 0
-                
-                # Smooth and slope
-                tcs_s_smooth = tcs_smoother.add(s_rel)
-                tcs_slope = 0
-                if tcs_last_smooth is not None:
-                    tcs_slope = (tcs_s_smooth - tcs_last_smooth) / period
-                tcs_last_smooth = tcs_s_smooth
-                
-                # Endpoint detection
-                condition = (tcs_s_smooth <= ALPHA_THRESHOLD and 
-                           abs(tcs_slope) <= BETA_THRESHOLD)
-                tcs_end = 1 if tcs_endpoint.check(condition) else 0
-                
-                # Write to CSV
-                with open(tcs_csv, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    row = [t, run_id,
-                          tcs_data['R'], tcs_data['G'], tcs_data['B'], tcs_data['C'],
-                          tcs_data['lux'], tcs_data['temp_K'],
-                          s_blue, s_rel, tcs_s_smooth, tcs_slope, tcs_end]
-                    writer.writerow(row)
-            
-            # Print status
-            if sample_count % 10 == 0:
-                status = f"t={t:.2f}s"
+            now = time.monotonic()
+
+            # Read AS7343 when its slot comes due
+            if HAS_AS7343 and now >= as_next:
+                t = timestamp()
+                as_data = read_as7343(as_sensor)
+
+                if as_data:
+                    # Dark subtract
+                    blue_raw = as_data.get('F2', 0)
+                    blue_corrected = max(0, blue_raw - as_baseline.get('F2', 0))
+
+                    # Calculate sum of visible channels
+                    vis_sum = 0
+                    for ch in ['F1', 'F2', 'FZ', 'F3', 'F4', 'F5', 'FY', 'F6', 'F7', 'F8']:
+                        vis_sum += max(0, as_data.get(ch, 0) - as_baseline.get(ch, 0))
+
+                    # Blue signal ratio
+                    s_blue = blue_corrected / vis_sum if vis_sum > 0 else 0
+
+                    # Establish S0 from first few samples
+                    if len(anchor_samples) < 5:
+                        anchor_samples.append(s_blue)
+                        as_s0 = sum(anchor_samples) / len(anchor_samples)
+
+                    # Relative signal
+                    s_rel = s_blue / as_s0 if as_s0 > 0 else 0
+
+                    # Smooth and slope
+                    as_s_smooth = as_smoother.add(s_rel)
+                    if as_last_smooth is not None:
+                        as_slope = (as_s_smooth - as_last_smooth) / period
+                    as_last_smooth = as_s_smooth
+
+                    # Endpoint detection
+                    condition = (as_s_smooth <= ALPHA_THRESHOLD and
+                               abs(as_slope) <= BETA_THRESHOLD)
+                    as_end = 1 if as_endpoint.check(condition) else 0
+
+                    # Write to CSV
+                    with open(as_csv, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        row = [t, run_id]
+                        row.extend([as_data.get(ch, 0) for ch in AS_CHANNELS])
+                        row.extend([s_blue, s_rel, as_s_smooth, as_slope, as_end])
+                        writer.writerow(row)
+
+                    sample_count += 1
+                    status_counter += 1
+
+                as_next += period
+                if HAS_AS7343 and HAS_TCS:
+                    tcs_next = max(tcs_next, as_next - period + tcs_offset)
+
+            # Read TCS34725 when its slot comes due
+            if HAS_TCS and now >= tcs_next:
+                t = timestamp()
+                tcs_data = read_tcs34725(tcs_sensor)
+
+                if tcs_data:
+                    # Dark subtract
+                    b_corrected = max(0, tcs_data['B'] - tcs_baseline.get('B', 0))
+                    r_corrected = max(0, tcs_data['R'] - tcs_baseline.get('R', 0))
+                    g_corrected = max(0, tcs_data['G'] - tcs_baseline.get('G', 0))
+
+                    # Blue ratio
+                    rgb_sum = r_corrected + g_corrected + b_corrected
+                    s_blue = b_corrected / rgb_sum if rgb_sum > 0 else 0
+
+                    # Establish S0
+                    if tcs_s0 is None and len(anchor_samples) >= 5:
+                        tcs_s0 = s_blue
+
+                    # Relative signal
+                    s_rel = s_blue / tcs_s0 if tcs_s0 else 0
+
+                    # Smooth and slope
+                    tcs_s_smooth = tcs_smoother.add(s_rel)
+                    if tcs_last_smooth is not None:
+                        tcs_slope = (tcs_s_smooth - tcs_last_smooth) / period
+                    tcs_last_smooth = tcs_s_smooth
+
+                    # Endpoint detection
+                    condition = (tcs_s_smooth <= ALPHA_THRESHOLD and
+                               abs(tcs_slope) <= BETA_THRESHOLD)
+                    tcs_end = 1 if tcs_endpoint.check(condition) else 0
+
+                    # Write to CSV
+                    with open(tcs_csv, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        row = [t, run_id,
+                              tcs_data['R'], tcs_data['G'], tcs_data['B'], tcs_data['C'],
+                              tcs_data['lux'], tcs_data['temp_K'],
+                              s_blue, s_rel, tcs_s_smooth, tcs_slope, tcs_end]
+                        writer.writerow(row)
+
+                    if not HAS_AS7343:
+                        sample_count += 1
+                        status_counter += 1
+
+                tcs_next += period
+
+            # Print status every 10 sensor events
+            if status_counter > 0 and status_counter % 10 == 0:
+                status = "t={:.2f}s".format(time.time())
                 if HAS_AS7343:
                     status += f" | AS7343: S={as_s_smooth:.4f}, slope={as_slope:+.5f}"
                 if HAS_TCS:
                     status += f" | TCS: S={tcs_s_smooth:.4f}, slope={tcs_slope:+.5f}"
                 print(status)
-            
+
             # Check for endpoint
             if (not HAS_AS7343 or as_end) and (not HAS_TCS or tcs_end):
-                print(f"\nENDPOINT DETECTED at t={t:.2f}s")
+                print(f"\nENDPOINT DETECTED at t={time.time():.2f}s")
                 time.sleep(HOLD_OFF_SEC)
                 break
-            
-            sample_count += 1
-            time.sleep(period)
-    
+
+            next_wake = min(
+                as_next if HAS_AS7343 else float('inf'),
+                tcs_next if HAS_TCS else float('inf')
+            )
+            sleep_duration = next_wake - time.monotonic()
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
+
     except KeyboardInterrupt:
         print("\n\nStopped by user")
     
